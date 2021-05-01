@@ -7,7 +7,10 @@ from pandas import DataFrame
 import nltk
 import random
 import shutil
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelWithLMHead
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, T5ForConditionalGeneration
+import transformers
+import torch
+
 
 import nlpaug.augmenter.char as nac
 import nlpaug.augmenter.word as naw
@@ -28,26 +31,13 @@ parser.add_argument("--ft", action="store_true")
 args = parser.parse_args()
 
 global model
-if args.aug == "t5" or args.aug == "t5_new":
-    if args.ft:
-        tokenizer = AutoTokenizer.from_pretrained("google/t5-v1_1-large")
-        model = None
-    else:
-        tokenizer = AutoTokenizer.from_pretrained("google/t5-v1_1-large")
-        model = AutoModelForSeq2SeqLM.from_pretrained("google/t5-v1_1-large")
-        model.eval()
-        model = model.cuda()
-elif args.aug == 'gpt':
-    tokenizer = AutoTokenizer.from_pretrained("gpt2-xl")
-    model = AutoModelWithLMHead.from_pretrained("gpt2-xl") 
-    model.eval()
-    model = model.cuda()
+if args.aug == "t5":
+    tokenizer = AutoTokenizer.from_pretrained("google/t5-v1_1-large")
+    model = None
 elif args.aug == "synonym":
     aug_model = naw.SynonymAug(aug_src='wordnet')
 elif args.aug == "synonym_ppdb":
     aug_model = naw.SynonymAug(aug_src='ppdb', model_path="ppdb-2.0-tldr")
-elif args.aug == "back_translation":
-    aug_model = naw.BackTranslationAug()
 else:
     raise NotImplementedError
 
@@ -58,27 +48,6 @@ def t5_generated_result(sent):
     output = tokenizer.decode(output_ids[0])
     output = output.split('<extra_id_0>')[1].split('<extra_id_1>')[0]
     print("T5 output:", output)
-    return output
-
-def t5_new(sent):
-    input_sent = 'Write two sentences that mean the same thing.\nSentence 1: "{}"\nSentence 2: "<extra_id_0>"'.format(sent)
-    input_ids = tokenizer(input_sent, return_tensors="pt").input_ids
-    input_ids = input_ids.cuda()
-    output_ids = model.generate(input_ids, num_beams=3)
-    output = tokenizer.decode(output_ids[0])
-    output = output.split('<extra_id_0>')[1].split('<extra_id_1>')[0]
-    print("T5 input:", input_sent)
-    print("T5 output:", output)
-    return output
-
-def gpt_new(sent):
-    sent = tokenizer.decode(tokenizer.encode(sent)[:32])
-    input_sent = 'Write two sentences that mean the same thing.\nSentence 1: "{}"\nSentence 2: "'.format(sent)
-    input_ids = tokenizer(input_sent, return_tensors="pt").input_ids
-    input_ids = input_ids.cuda()
-    output_ids = model.generate(input_ids, num_beams=3, max_length=64)
-    output = tokenizer.decode(output_ids[0]).split('Sentence 2: "')[-1].split('"')[0]
-    print("GPT:", input_sent + output)
     return output
 
 def get_sentence(task, line):
@@ -202,12 +171,6 @@ def aug(sents, args):
                 print("Masked sent:", input_sent)
                 print("New sent:", new_sent)
                 new_sents.append(new_sent)
-            elif args.aug == "t5_new":
-                new_sent = t5_new(sent)
-                new_sents.append(new_sent)
-            elif args.aug == "gpt":
-                new_sent = gpt_new(sent)
-                new_sents.append(new_sent)
             else:
                 print("##################")
                 new_sent = aug_model.augment(sent)
@@ -221,13 +184,6 @@ def main():
 
     for task in args.task:
         for seed in args.seed:
-            if args.aug == "t5" and args.ft:
-                print("Load ft model")
-                global model
-                model = AutoModelForSeq2SeqLM.from_pretrained("ft_t5/{}/{}-{}".format(task, args.k, seed))
-                model.eval()
-                model = model.cuda()
-
             folder = os.path.join(args.data_dir, task, '{}-{}'.format(args.k, seed))
             new_folder = os.path.join(args.data_dir, task + "-" + args.aug_name, '{}-{}'.format(args.k, seed))
             os.makedirs(new_folder, exist_ok=True)
@@ -240,6 +196,80 @@ def main():
             for split in dataset:
                 print('{}-{}-{}-{}'.format(task, args.k, seed, split))
                 lines = dataset[split]
+
+                # train new model
+                training_set = []
+                for line in lines:
+                    sents = get_sentence(task, line)
+                    training_set += sents
+                print("total sent:", len(training_set))
+
+                # Train
+                print("Load T5 model")
+                global model
+
+                model = T5ForConditionalGeneration.from_pretrained("google/t5-v1_1-large")
+                model = model.cuda()
+                model.train()
+                decay_parameters=['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+                grouped_parameters = [
+                    {
+                        "params": [p for n, p in model.named_parameters() if n in decay_parameters],
+                        "weight_decay": 0.01,
+                        "lr": 1e-5
+                    },
+                    {
+                        "params": [p for n, p in model.named_parameters() if n not in decay_parameters],
+                        "weight_decay": 0.0,
+                        "lr": 1e-5
+                    },
+                ]
+                optimizer = transformers.AdamW(grouped_parameters)
+                
+                num_epochs = 10
+                batch_size = 8
+                for epoch_id in range(num_epochs):
+                    total_batch = len(training_set) // batch_size
+                    for batch_id in range(total_batch):
+                        ori_batch_sent = training_set[batch_id*batch_size:(batch_id+1)*batch_size]
+                        batch_sent = []
+                        batch_label = []
+                        for sent in ori_batch_sent:
+                            tokens = sent.split(' ') 
+                            l = min(max(int(len(tokens) * args.aug_rate), 1), len(tokens) - 1)
+                            start = random.randint(0, len(tokens) - l)
+                            end = start + l
+                            new_sent = ' '.join(tokens[:start]) + "<extra_id_0> " + ' '.join(tokens[end:])
+                            new_label = "<extra_id_0>" + '  '.join(tokens[start:end]) + "<extra_id_1>"
+                            # print("######")
+                            # print(new_sent)
+                            # print(new_label)
+
+                            batch_sent.append(new_sent)
+                            batch_label.append(new_label)
+
+                        input_batch = tokenizer(batch_sent, return_tensors="pt", padding=True, truncation=True, max_length=32)
+                        decoder_input_batch = tokenizer(batch_label, return_tensors="pt", padding=True, truncation=True, max_length=32)
+                        labels = decoder_input_batch["input_ids"]
+                        tmp = torch.zeros(decoder_input_batch["input_ids"].size()).long()
+                        tmp[:, 1:] = decoder_input_batch["input_ids"][:, :-1]
+                        decoder_input_batch["input_ids"] = tmp
+
+                        input_batch = {k: v.cuda() for k, v in input_batch.items()}
+                        decoder_input_batch = {"decoder_" + k: v.cuda() for k, v in decoder_input_batch.items()}
+                        labels = labels.cuda()
+
+                        output = model(**input_batch, **decoder_input_batch, labels=labels, return_dict=True)
+                        loss = output.loss
+                        print(loss.item())
+
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                
+                print("finish training")
+                model.eval()
+
                 new_lines = []
                 for line in lines:
                     sents = get_sentence(task, line)
